@@ -38,7 +38,7 @@ def unique(x, dim=None):
 
 class HMLC(nn.Module):
     def __init__(self, temperature=0.07,
-                 base_temperature=0.07, layer_penalty=None, loss_type='hmce'):
+                 base_temperature=0.07, layer_penalty=None, loss_type='hmce', label_depths=None):
         super(HMLC, self).__init__()
         self.temperature = temperature
         self.base_temperature = base_temperature
@@ -48,35 +48,50 @@ class HMLC(nn.Module):
             self.layer_penalty = layer_penalty
         self.sup_con_loss = SupConLoss(temperature)
         self.loss_type = loss_type
+        self.label_depths = label_depths
 
     def pow_2(self, value):
         return torch.pow(2, value)
 
     def forward(self, features, labels):
         device = (torch.device('cuda')
-                  if features.is_cuda
+                  if torch.cuda.is_available()
                   else torch.device('cpu'))
-        mask = torch.ones(labels.shape).to(device)
+        mask = labels.clone().detach().to(device)
         cumulative_loss = torch.tensor(0.0).to(device)
         max_loss_lower_layer = torch.tensor(float('-inf'))
-        for l in range(1,labels.shape[1]):
-            mask[:, labels.shape[1]-l:] = 0
+        self.label_depths = self.label_depths.to(device)
+        max_depths = int(torch.max(self.label_depths).item())
+
+        for l in range(max_depths):
+            # get depth_mask with those smaller than max_depths - l
+            depth_mask = self.label_depths <= (max_depths - l) # shape (num_labels, 1)
+            # check the device for depth_mask and mask
+            assert depth_mask.device == mask.device, f'depth_mask.device: {depth_mask.device}, mask.device: {mask.device}'
+            # filter the mask with depth_mask
+            mask = mask * depth_mask # shape (batch_size, num_labels)
+            # mask[:, labels.shape[1]-l:] = 0
             layer_labels = labels * mask
             mask_labels = torch.stack([torch.all(torch.eq(layer_labels[i], layer_labels), dim=1)
                                        for i in range(layer_labels.shape[0])]).type(torch.uint8).to(device)
+
             layer_loss = self.sup_con_loss(features, mask=mask_labels)
+
+            # l = l+1
             if self.loss_type == 'hmc':
                 cumulative_loss += self.layer_penalty(torch.tensor(
-                  1/(l)).type(torch.float)) * layer_loss
+                  l).type(torch.float)) * layer_loss
             elif self.loss_type == 'hce':
                 layer_loss = torch.max(max_loss_lower_layer.to(layer_loss.device), layer_loss)
                 cumulative_loss += layer_loss
             elif self.loss_type == 'hmce':
                 layer_loss = torch.max(max_loss_lower_layer.to(layer_loss.device), layer_loss)
-                cumulative_loss += self.layer_penalty(torch.tensor(
-                    1/l).type(torch.float)) * layer_loss
+                tmp = torch.tensor(1 / (max_depths - l)).type(torch.float).to(layer_loss.device)
+                layer_loss = self.layer_penalty(tmp) * layer_loss
+                cumulative_loss += layer_loss
             else:
-                raise NotImplementedError('Unknown loss')
+                raise ValueError('Invalid loss type')
+                  
             _, unique_indices = unique(layer_labels, dim=0)
             max_loss_lower_layer = torch.max(
                 max_loss_lower_layer.to(layer_loss.device), layer_loss)
@@ -84,7 +99,6 @@ class HMLC(nn.Module):
             mask = mask[unique_indices]
             features = features[unique_indices]
         return cumulative_loss / labels.shape[1]
-
 
 class SupConLoss(nn.Module):
     """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
@@ -109,7 +123,7 @@ class SupConLoss(nn.Module):
             A loss scalar.
         """
         device = (torch.device('cuda')
-                  if features.is_cuda
+                  if torch.cuda.is_available()
                   else torch.device('cpu'))
 
         if len(features.shape) < 3:
@@ -131,7 +145,7 @@ class SupConLoss(nn.Module):
         else:
             mask = mask.float().to(device)
 
-        contrast_count = features.shape[1]
+        contrast_count = features.shape[1] # 2 for pos-neg pairs
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
         if self.contrast_mode == 'one':
             anchor_feature = features[:, 0]
@@ -159,14 +173,17 @@ class SupConLoss(nn.Module):
             torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
             0
         )
-        mask = mask * logits_mask
+        mask = mask * logits_mask # attention masking
 
+        ## TODO think about whether here's done by masking to compute the contrastive loss
+        
+        eplison = 1e-8
         # compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        exp_logits = torch.exp(logits) * logits_mask # [batch_size * n_views, batch_size * n_views]
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + eplison) # [batch_size * n_views, batch_size * n_views]
 
         # compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + eplison) # [batch_size * n_views]
 
         # loss
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos

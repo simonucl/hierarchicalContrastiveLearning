@@ -8,9 +8,10 @@ Modified by shu.zhang@salesforce.com
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.utils import load_state_dict_from_url
+from torch.hub import load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
 from torch import Tensor
+from transformers import BertModel, BertTokenizer
 
 
 __all__ = ['ResNet', 'resnet50']
@@ -257,12 +258,14 @@ def _resnet(
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch],
                                               progress=progress)
+        state_dict.pop('fc.weight')
+        state_dict.pop('fc.bias')
         model.load_state_dict(state_dict)
     return model
 
 
 
-def resnet50(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
+def resnet50(pretrained: bool = True, progress: bool = True, **kwargs: Any) -> ResNet:
     r"""ResNet-50 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
     Args:
@@ -274,6 +277,7 @@ def resnet50(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> 
 
 model_dict = {
     'resnet50': [resnet50, 2048],
+    'bert-base-uncased': [BertModel, 768],
 }
 
 
@@ -297,7 +301,7 @@ class MyResNet(nn.Module):
 
     def forward(self, x):
         feat = self.encoder(x)
-        feat = F.normalize(self.head(feat), dim=1)
+        feat = F.normalize(self.head(feat), dim=1) # shape: (bs, feat_dim)
         return feat
 
 
